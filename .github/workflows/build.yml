@@ -1,0 +1,70 @@
+name: Build image_index.db
+
+on:
+  schedule:
+    - cron: '0 3 * * *'   # 매일 UTC 03:00 (KST 12:00)
+  workflow_dispatch:       # 수동 트리거
+    inputs:
+      force_all:
+        description: '전체 재빌드 (기존 항목 포함)'
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # 이전 릴리즈의 image_index.db를 가져와서 증분 빌드에 활용
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download latest image_index.db (for incremental build)
+        if: ${{ !inputs.force_all }}
+        continue-on-error: true   # 첫 빌드이거나 릴리즈가 없으면 스킵
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download --pattern "image_index.db" --dir . || true
+          if [ -f image_index.db ]; then
+            echo "기존 DB 다운로드 완료"
+          else
+            echo "기존 DB 없음 - 전체 빌드"
+          fi
+
+      - name: Build image_index.db
+        run: |
+          FORCE_FLAG=""
+          if [ "${{ inputs.force_all }}" = "true" ]; then
+            FORCE_FLAG="--force-all"
+          fi
+          python scripts/build_image_db.py --db-path image_index.db $FORCE_FLAG
+
+      - name: Get current date tag
+        id: tag
+        run: echo "tag=$(date +'%Y.%m.%d')" >> $GITHUB_OUTPUT
+
+      - name: Create or update Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v${{ steps.tag.outputs.tag }}"
+
+          # 오늘 태그 릴리즈가 이미 있으면 삭제 후 재생성
+          gh release delete "$TAG" --yes 2>/dev/null || true
+
+          gh release create "$TAG" \
+            image_index.db \
+            --title "Image DB $TAG" \
+            --notes-file release_notes.md \
+            --latest
