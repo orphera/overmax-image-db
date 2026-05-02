@@ -1,8 +1,8 @@
 name: Build image_index.db
 
 on:
-  schedule:
-    - cron: '0 3 * * *'   # 매일 UTC 03:00 (KST 12:00)
+  #schedule:
+  #  - cron: '0 3 * * *'   # 매일 UTC 03:00 (KST 12:00)
   workflow_dispatch:       # 수동 트리거
     inputs:
       force_all:
