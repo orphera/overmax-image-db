@@ -197,7 +197,7 @@ def download_jacket(song_id: str, client: httpx.Client) -> np.ndarray | None:
 @dataclass
 class BuildResult:
     total: int
-    added: list[dict]   # 추가된 곡: {"song_id", "name", "composer"}
+    added: list[dict]
     fail: int
     skip: int
 
@@ -217,8 +217,10 @@ def build(db_path: Path, force_all: bool) -> BuildResult:
     targets = [sid for sid in all_ids if sid not in existing_ids]
     print(f"[Build] 전체 {len(all_ids)}곡 / 기존 {len(existing_ids)}곡 / 신규 {len(targets)}곡")
 
+    # ✅ 추가 (변경 없음)
     if not targets:
         print("[Build] 추가할 곡 없음 - 완료")
+        Path("no_changes").write_text("1")
         return BuildResult(total=len(all_ids), added=[], fail=0, skip=0)
 
     added = []
@@ -249,6 +251,11 @@ def build(db_path: Path, force_all: bool) -> BuildResult:
                 time.sleep(DOWNLOAD_INTERVAL_SEC)
 
     print(f"\n[Build] 완료: success={len(added)}, fail={fail}, skip={skip}")
+
+    # ✅ 추가 (혹시라도 추가 0이면)
+    if not added:
+        Path("no_changes").write_text("1")
+
     return BuildResult(total=len(all_ids), added=added, fail=fail, skip=skip)
 
 

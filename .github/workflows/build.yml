@@ -1,9 +1,9 @@
-name: Build image_index.db
+name: Build Image DB
 
 on:
-  #schedule:
-  #  - cron: '0 3 * * *'   # 매일 UTC 03:00 (KST 12:00)
-  workflow_dispatch:       # 수동 트리거
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
     inputs:
       force_all:
         description: '전체 재빌드 (기존 항목 포함)'
@@ -50,21 +50,44 @@ jobs:
           fi
           python scripts/build_image_db.py --db-path image_index.db $FORCE_FLAG
 
-      - name: Get current date tag
-        id: tag
-        run: echo "tag=$(date +'%Y.%m.%d')" >> $GITHUB_OUTPUT
+      - name: Check changes
+        id: changes
+        run: |
+          if [ -f no_changes ]; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
 
-      - name: Create or update Release
+      - name: Generate tag
+        id: tag
+        if: steps.changes.outputs.changed == 'true'
+        run: |
+          DATE=$(date +'%Y.%m.%d')
+
+          LIST=$(gh release list --limit 100 | awk '{print $1}' | grep "^$DATE" || true)
+
+          if [ -z "$LIST" ]; then
+            IDX=0
+          else
+            IDX=$(echo "$LIST" | sed "s/^$DATE\.//" | sort -n | tail -n1)
+            IDX=$((IDX+1))
+          fi
+
+          TAG="${DATE}.${IDX}"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create Release
+        if: steps.changes.outputs.changed == 'true'
         run: |
           TAG="v${{ steps.tag.outputs.tag }}"
-
-          # 오늘 태그 릴리즈가 이미 있으면 삭제 후 재생성
-          gh release delete "$TAG" --yes 2>/dev/null || true
 
           gh release create "$TAG" \
             image_index.db \
             --title "Image DB $TAG" \
             --notes-file release_notes.md \
             --latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
