@@ -13,14 +13,14 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
+import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from dataclasses import dataclass, field
 
-import cv2
 import httpx
-import numpy as np
 
 # ------------------------------------------------------------------
 # 설정
@@ -38,30 +38,7 @@ DOWNLOAD_INTERVAL_SEC = 0.1   # V-Archive 서버 부하 방지용 딜레이
 # image_index.db 관련 (image_db.py 로직 인라인)
 # ------------------------------------------------------------------
 
-def _ensure_schema(conn: sqlite3.Connection):
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS images (
-            id       INTEGER PRIMARY KEY AUTOINCREMENT,
-            image_id TEXT NOT NULL,
-            phash    TEXT NOT NULL,
-            dhash    TEXT NOT NULL,
-            ahash    TEXT NOT NULL,
-            hog      BLOB NOT NULL,
-            orb      BLOB
-        )
-    """)
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_images_image_id ON images (image_id)"
-    )
-    conn.execute("""
-        DELETE FROM images
-        WHERE id NOT IN (
-            SELECT MAX(id) FROM images GROUP BY image_id
-        )
-    """)
-    conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS uq_images_image_id ON images (image_id)"
-    )
+
 
 
 def _get_existing_ids(db_path: Path) -> set[str]:
@@ -76,85 +53,7 @@ def _get_existing_ids(db_path: Path) -> set[str]:
         return set()
 
 
-def _upsert_entry(conn: sqlite3.Connection, song_id: str, img: np.ndarray) -> bool:
-    gray = _to_gray(img)
-    if gray is None:
-        return False
-    ph, dh, ah = _compute_hashes(gray)
-    hog = _compute_hog(gray)
-    try:
-        conn.execute(
-            """
-            INSERT INTO images (image_id, phash, dhash, ahash, hog, orb)
-            VALUES (?, ?, ?, ?, ?, NULL)
-            ON CONFLICT(image_id) DO UPDATE SET
-                phash = excluded.phash,
-                dhash = excluded.dhash,
-                ahash = excluded.ahash,
-                hog   = excluded.hog,
-                orb   = NULL
-            """,
-            (song_id, ph, dh, ah, hog.tobytes()),
-        )
-        return True
-    except Exception as e:
-        print(f"[DB] upsert 실패 ({song_id}): {e}")
-        return False
 
-
-# ------------------------------------------------------------------
-# 이미지 처리 (image_db.py에서 복사)
-# ------------------------------------------------------------------
-
-def _to_gray(img: np.ndarray) -> np.ndarray | None:
-    if img is None or img.size == 0:
-        return None
-    if img.ndim == 2:
-        return img
-    if img.ndim == 3 and img.shape[2] == 4:
-        return cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
-    if img.ndim == 3 and img.shape[2] == 3:
-        return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    return None
-
-
-def _bits_to_hex(bits: np.ndarray) -> str:
-    packed = np.packbits(bits.reshape(-1).astype(np.uint8), bitorder="big")
-    return "".join(f"{b:02x}" for b in packed)
-
-
-def _phash(gray: np.ndarray) -> str:
-    r = cv2.resize(gray, (32, 32), interpolation=cv2.INTER_AREA).astype(np.float32)
-    dct = cv2.dct(r)
-    low = dct[:8, :8]
-    median = float(np.median(low.reshape(-1)[1:]))
-    return _bits_to_hex(low > median)
-
-
-def _dhash(gray: np.ndarray) -> str:
-    r = cv2.resize(gray, (9, 8), interpolation=cv2.INTER_AREA).astype(np.float32)
-    return _bits_to_hex(r[:, 1:] > r[:, :-1])
-
-
-def _ahash(gray: np.ndarray) -> str:
-    r = cv2.resize(gray, (8, 8), interpolation=cv2.INTER_AREA).astype(np.float32)
-    return _bits_to_hex(r > float(np.mean(r)))
-
-
-def _compute_hashes(gray: np.ndarray) -> tuple[str, str, str]:
-    return _phash(gray), _dhash(gray), _ahash(gray)
-
-
-def _compute_hog(gray: np.ndarray) -> np.ndarray:
-    resized = cv2.resize(gray, (64, 64), interpolation=cv2.INTER_AREA)
-    descriptor = cv2.HOGDescriptor(
-        _winSize=(64, 64), _blockSize=(16, 16),
-        _blockStride=(8, 8), _cellSize=(8, 8), _nbins=9,
-    )
-    features = descriptor.compute(resized)
-    if features is None:
-        return np.zeros((1764,), dtype=np.float32)
-    return features.reshape(-1).astype(np.float32)
 
 
 # ------------------------------------------------------------------
@@ -175,16 +74,14 @@ def fetch_songs() -> list[dict]:
         sys.exit(1)
 
 
-def download_jacket(song_id: str, client: httpx.Client) -> np.ndarray | None:
+def download_jacket_bytes(song_id: str, client: httpx.Client) -> bytes | None:
     url = JACKET_URL_TMPL.format(song_id=song_id)
     try:
         resp = client.get(url, timeout=REQUEST_TIMEOUT)
         if resp.status_code == 404:
             return None
         resp.raise_for_status()
-        img_array = np.frombuffer(resp.content, dtype=np.uint8)
-        img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-        return img
+        return resp.content
     except Exception as e:
         print(f"[Download] 실패 ({song_id}): {e}")
         return None
@@ -223,32 +120,60 @@ def build(db_path: Path, force_all: bool) -> BuildResult:
         Path("no_changes").write_text("1")
         return BuildResult(total=len(all_ids), added=[], fail=0, skip=0)
 
-    added = []
-    fail = 0
     skip = 0
+    downloaded_files = []
 
-    with httpx.Client() as client:
-        with sqlite3.connect(db_path) as conn:
-            _ensure_schema(conn)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        print(f"[Build] 임시 자켓 디렉토리 생성: {tmp_path}")
+
+        # 1. 이미지 다운로드 진행 및 임시 저장
+        with httpx.Client() as client:
             for i, song_id in enumerate(targets, 1):
-                img = download_jacket(song_id, client)
-                if img is None:
+                img_data = download_jacket_bytes(song_id, client)
+                if img_data is None:
                     print(f"[{i}/{len(targets)}] SKIP  {song_id} (이미지 없음)")
                     skip += 1
-                elif _upsert_entry(conn, song_id, img):
-                    song = song_map[song_id]
-                    print(f"[{i}/{len(targets)}] OK    {song_id} ({song.get('name', '')})")
-                    added.append({
-                        "song_id": song_id,
-                        "name": song.get("name", ""),
-                        "composer": song.get("composer", ""),
-                    })
                 else:
-                    print(f"[{i}/{len(targets)}] FAIL  {song_id}")
-                    fail += 1
-
-                conn.commit()
+                    file_path = tmp_path / f"{song_id}.jpg"
+                    file_path.write_bytes(img_data)
+                    downloaded_files.append(song_id)
+                    print(f"[{i}/{len(targets)}] DOWNLOADED {song_id}")
                 time.sleep(DOWNLOAD_INTERVAL_SEC)
+
+        # 2. Rust db_builder CLI 실행
+        if downloaded_files:
+            # 메인 overmax 저장소는 상대경로로 ../overmax 에 있음
+            cmd = [
+                "cargo", "run", "--manifest-path", "../overmax/Cargo.toml",
+                "-p", "overmax-data", "--bin", "db_builder", "--",
+                "--image-dir", str(tmp_path), "--db-path", str(db_path)
+            ]
+            print(f"[Build] Rust db_builder 실행: {' '.join(cmd)}")
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                print(result.stdout)
+                if result.stderr:
+                    print(f"[Warn] CLI 표준 에러 출력:\n{result.stderr}")
+            except subprocess.CalledProcessError as e:
+                print(f"[Build] Rust db_builder 실행 실패 (exit={e.returncode}):\n{e.stderr}")
+                raise e
+
+    # 3. 최종 DB 상태를 확인하여 추가된 곡 계산
+    new_existing_ids = _get_existing_ids(db_path)
+    newly_added_ids = new_existing_ids - existing_ids
+
+    added = []
+    for song_id in newly_added_ids:
+        song = song_map.get(song_id)
+        if song:
+            added.append({
+                "song_id": song_id,
+                "name": song.get("name", ""),
+                "composer": song.get("composer", ""),
+            })
+
+    fail = len(downloaded_files) - len(added)
 
     print(f"\n[Build] 완료: success={len(added)}, fail={fail}, skip={skip}")
 
