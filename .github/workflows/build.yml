@@ -21,6 +21,31 @@ jobs:
           # 이전 릴리즈의 image_index.db를 가져와서 증분 빌드에 활용
           fetch-depth: 1
 
+      - name: Get latest overmax commit hash
+        id: overmax-hash
+        run: |
+          HASH=$(git ls-remote https://github.com/orphera/overmax.git HEAD | awk '{print $1}')
+          echo "hash=$HASH" >> $GITHUB_OUTPUT
+
+      - name: Cache db-builder binary
+        id: cache-db-builder
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/db_builder
+          key: ${{ runner.os }}-db-builder-${{ steps.overmax-hash.outputs.hash }}
+
+      - name: Install Rust toolchain
+        if: steps.cache-db-builder.outputs.cache-hit != 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install db-builder via Cargo
+        if: steps.cache-db-builder.outputs.cache-hit != 'true'
+        run: |
+          cargo install --git https://github.com/orphera/overmax.git --bin db_builder
+
+      - name: Add cargo bin to PATH
+        run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:

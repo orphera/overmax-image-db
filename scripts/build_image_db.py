@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -143,12 +144,19 @@ def build(db_path: Path, force_all: bool) -> BuildResult:
 
         # 2. Rust db_builder CLI 실행
         if downloaded_files:
-            # 메인 overmax 저장소는 상대경로로 ../overmax 에 있음
-            cmd = [
-                "cargo", "run", "--manifest-path", "../overmax/Cargo.toml",
-                "-p", "overmax-data", "--bin", "db_builder", "--",
-                "--image-dir", str(tmp_path), "--db-path", str(db_path)
-            ]
+            global_cli = shutil.which("db_builder")
+            if global_cli:
+                cmd = [
+                    global_cli,
+                    "--image-dir", str(tmp_path),
+                    "--db-path", str(db_path)
+                ]
+            else:
+                cmd = [
+                    "cargo", "run", "--manifest-path", "../overmax/Cargo.toml",
+                    "-p", "overmax-data", "--bin", "db_builder", "--",
+                    "--image-dir", str(tmp_path), "--db-path", str(db_path)
+                ]
             print(f"[Build] Rust db_builder 실행: {' '.join(cmd)}")
             try:
                 result = subprocess.run(cmd, capture_output=True, text=True, check=True)
