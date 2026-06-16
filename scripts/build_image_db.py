@@ -103,9 +103,6 @@ class BuildResult:
 def build(db_path: Path, force_all: bool) -> BuildResult:
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with sqlite3.connect(db_path) as conn:
-        _ensure_schema(conn)
-        conn.commit()
 
     songs = fetch_songs()
     song_map = {str(s["title"]): s for s in songs}
