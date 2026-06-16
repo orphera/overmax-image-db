@@ -41,7 +41,7 @@ jobs:
       - name: Install db-builder via Cargo
         if: steps.cache-db-builder.outputs.cache-hit != 'true'
         run: |
-          cargo install --git https://github.com/orphera/overmax.git --bin db_builder
+          cargo install --git https://github.com/orphera/overmax.git overmax-data --bin db_builder
 
       - name: Add cargo bin to PATH
         run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
